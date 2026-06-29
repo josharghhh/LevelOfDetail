@@ -303,6 +303,17 @@ def create_wedge_preview_object(context, source_obj, result, collection, write_c
     return new_obj
 
 
+def should_report_progress(index, total):
+    if total <= 10:
+        return True
+    return index == 1 or index == total or index % 10 == 0
+
+
+def report_progress_milestone(operator, index, total, obj_name, stage):
+    if should_report_progress(index, total):
+        operator.report({"INFO"}, f"{stage}: {obj_name} ({index}/{total})")
+
+
 def mesh_surface_area(mesh):
     return sum(poly.area for poly in mesh.polygons)
 
@@ -1001,28 +1012,35 @@ class VLOD_OT_wedge_preview(bpy.types.Operator):
             context.scene.collection.children.link(collision_collection)
         results = []
 
-        for obj in objects:
-            source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
-            if not source["faces"]:
-                results.append({
-                    "source": obj.name,
-                    "status": "skipped",
-                    "reason": "no triangulatable faces",
-                })
-                continue
-            if len(source["faces"]) > settings.max_preview_triangles and not settings.allow_heavy_preview:
-                results.append({
-                    "source": obj.name,
-                    "status": "skipped",
-                    "reason": f"source triangle count {len(source['faces'])} exceeds Max Preview Tris {settings.max_preview_triangles}",
-                    "source_triangles": len(source["faces"]),
-                    "suggestion": "test a smaller part first or enable Allow Heavy Preview",
-                })
-                continue
+        progress_total = len(objects)
+        context.window_manager.progress_begin(0, progress_total)
+        try:
+            for index, obj in enumerate(objects, start=1):
+                context.window_manager.progress_update(index - 1)
+                report_progress_milestone(self, index, progress_total, obj.name, "Wedge preview")
+                source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
+                if not source["faces"]:
+                    results.append({
+                        "source": obj.name,
+                        "status": "skipped",
+                        "reason": "no triangulatable faces",
+                    })
+                    context.window_manager.progress_update(index)
+                    continue
+                if len(source["faces"]) > settings.max_preview_triangles and not settings.allow_heavy_preview:
+                    results.append({
+                        "source": obj.name,
+                        "status": "skipped",
+                        "reason": f"source triangle count {len(source['faces'])} exceeds Max Preview Tris {settings.max_preview_triangles}",
+                        "source_triangles": len(source["faces"]),
+                        "suggestion": "test a smaller part first or enable Allow Heavy Preview",
+                    })
+                    context.window_manager.progress_update(index)
+                    continue
 
-            reducer = wedge_backend.simplify_wedge_mesh_partitioned if settings.wedge_partition_islands else wedge_backend.simplify_wedge_mesh
-            target_faces = settings.wedge_target_triangles or None
-            reduced = reducer(
+                reducer = wedge_backend.simplify_wedge_mesh_partitioned if settings.wedge_partition_islands else wedge_backend.simplify_wedge_mesh
+                target_faces = settings.wedge_target_triangles or None
+                reduced = reducer(
                     source["vertices"],
                     source["uvs"],
                     source["faces"],
@@ -1043,35 +1061,38 @@ class VLOD_OT_wedge_preview(bpy.types.Operator):
                     boundary_weight=settings.boundary_weight,
                     preserve_manifold=settings.preserve_manifold,
                     target_faces=target_faces,
-            )
-            preview = create_wedge_preview_object(
-                context,
-                obj,
-                reduced,
-                collection,
-                write_custom_normals=settings.wedge_write_custom_normals,
-            )
-            validation = compare_payloads(source, reduced)
-            gate = validation_gate(validation, settings)
-            collision_name = None
-            if collision_collection:
-                collision_name = create_collision_box_proxy(context, obj, collision_collection).name
-            results.append({
-                "source": obj.name,
-                "preview": preview.name,
-                "collision_proxy": collision_name,
-                "status": "created",
-                "source_mesh_vertices": source["source_vertices"],
-                "wedge_vertices": source["wedge_vertices"],
-                "source_polygons": source["source_faces"],
-                "source_triangles": len(source["faces"]),
-                "preview_triangles": len(reduced["faces"]),
-                "preview_vertices": len(reduced["vertices"]),
-                "preview_vertex_groups": len({name for weights in reduced.get("group_weights", []) for name in weights}),
-                "stats": reduced["stats"],
-                "validation": validation,
-                "validation_gate": gate,
-            })
+                )
+                preview = create_wedge_preview_object(
+                    context,
+                    obj,
+                    reduced,
+                    collection,
+                    write_custom_normals=settings.wedge_write_custom_normals,
+                )
+                validation = compare_payloads(source, reduced)
+                gate = validation_gate(validation, settings)
+                collision_name = None
+                if collision_collection:
+                    collision_name = create_collision_box_proxy(context, obj, collision_collection).name
+                results.append({
+                    "source": obj.name,
+                    "preview": preview.name,
+                    "collision_proxy": collision_name,
+                    "status": "created",
+                    "source_mesh_vertices": source["source_vertices"],
+                    "wedge_vertices": source["wedge_vertices"],
+                    "source_polygons": source["source_faces"],
+                    "source_triangles": len(source["faces"]),
+                    "preview_triangles": len(reduced["faces"]),
+                    "preview_vertices": len(reduced["vertices"]),
+                    "preview_vertex_groups": len({name for weights in reduced.get("group_weights", []) for name in weights}),
+                    "stats": reduced["stats"],
+                    "validation": validation,
+                    "validation_gate": gate,
+                })
+                context.window_manager.progress_update(index)
+        finally:
+            context.window_manager.progress_end()
 
         report = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1279,38 +1300,49 @@ class VLOD_OT_collision_hull(bpy.types.Operator):
         context.scene.collection.children.link(collection)
         results = []
 
-        for obj in objects:
-            if settings.collision_method == "BOX":
-                proxy = create_collision_box_proxy(context, obj, collection)
+        progress_total = len(objects)
+        context.window_manager.progress_begin(0, progress_total)
+        try:
+            for index, obj in enumerate(objects, start=1):
+                context.window_manager.progress_update(index - 1)
+                report_progress_milestone(self, index, progress_total, obj.name, "Collision proxy")
+                if settings.collision_method == "BOX":
+                    proxy = create_collision_box_proxy(context, obj, collection)
+                    results.append({
+                        "source": obj.name, "proxy": proxy.name,
+                        "method": "BOX", "status": "created",
+                    })
+                    context.window_manager.progress_update(index)
+                    continue
+
+                source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
+                if not source["vertices"]:
+                    results.append({"source": obj.name, "status": "skipped", "reason": "no vertices"})
+                    context.window_manager.progress_update(index)
+                    continue
+
+                max_hulls = 1 if settings.collision_method == "HULL" else settings.collision_max_hulls
+                hulls = vehicle_reducers.convex_decompose(source["vertices"], max_hulls=max_hulls)
+                if not hulls:
+                    results.append({"source": obj.name, "status": "skipped", "reason": "hull generation failed"})
+                    context.window_manager.progress_update(index)
+                    continue
+                proxy = create_convex_proxy(context, obj, hulls, collection)
+                total_volume = sum(
+                    vehicle_reducers.hull_volume(h["vertices"], h["faces"]) for h in hulls
+                )
                 results.append({
-                    "source": obj.name, "proxy": proxy.name,
-                    "method": "BOX", "status": "created",
+                    "source": obj.name,
+                    "proxy": proxy.name,
+                    "method": settings.collision_method,
+                    "status": "created",
+                    "hull_count": len(hulls),
+                    "proxy_triangles": sum(len(h["faces"]) for h in hulls),
+                    "proxy_volume": round(total_volume, 6),
                 })
-                continue
-
-            source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
-            if not source["vertices"]:
-                results.append({"source": obj.name, "status": "skipped", "reason": "no vertices"})
-                continue
-
-            max_hulls = 1 if settings.collision_method == "HULL" else settings.collision_max_hulls
-            hulls = vehicle_reducers.convex_decompose(source["vertices"], max_hulls=max_hulls)
-            if not hulls:
-                results.append({"source": obj.name, "status": "skipped", "reason": "hull generation failed"})
-                continue
-            proxy = create_convex_proxy(context, obj, hulls, collection)
-            total_volume = sum(
-                vehicle_reducers.hull_volume(h["vertices"], h["faces"]) for h in hulls
-            )
-            results.append({
-                "source": obj.name,
-                "proxy": proxy.name,
-                "method": settings.collision_method,
-                "status": "created",
-                "hull_count": len(hulls),
-                "proxy_triangles": sum(len(h["faces"]) for h in hulls),
-                "proxy_volume": round(total_volume, 6),
-            })
+                context.window_manager.progress_update(index)
+        finally:
+            context.window_manager.progress_end()
 
         report = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1402,73 +1434,89 @@ class VLOD_OT_safe_test_pack(bpy.types.Operator):
         context.scene.collection.children.link(collision_collection)
 
         marked_vertices = 0
-        for obj, _ in analysed:
-            _, count = create_protection_vertex_group(obj, angle_limit)
-            marked_vertices += count
-
         results = []
         skipped = []
-        for obj, stats in analysed:
-            if obj not in [candidate[0] for candidate in candidates]:
-                skipped.append({
-                    "source": obj.name,
-                    "triangles": stats["triangles"],
-                    "reason": "not in safe preview candidate set or above triangle guard",
-                })
+        progress_total = len(analysed) + len(candidates)
+        progress_index = 0
+        context.window_manager.progress_begin(0, progress_total)
+        try:
+            for obj, _ in analysed:
+                progress_index += 1
+                context.window_manager.progress_update(progress_index - 1)
+                report_progress_milestone(self, progress_index, progress_total, obj.name, "Safe test constraints")
+                _, count = create_protection_vertex_group(obj, angle_limit)
+                marked_vertices += count
+                context.window_manager.progress_update(progress_index)
 
-        for obj, stats in candidates:
-            source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
-            if not source["faces"]:
+            candidate_objects = [candidate[0] for candidate in candidates]
+            for obj, stats in analysed:
+                if obj not in candidate_objects:
+                    skipped.append({
+                        "source": obj.name,
+                        "triangles": stats["triangles"],
+                        "reason": "not in safe preview candidate set or above triangle guard",
+                    })
+
+            for obj, stats in candidates:
+                progress_index += 1
+                context.window_manager.progress_update(progress_index - 1)
+                report_progress_milestone(self, progress_index, progress_total, obj.name, "Safe test preview")
+                source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
+                if not source["faces"]:
+                    results.append({
+                        "source": obj.name,
+                        "status": "skipped",
+                        "reason": "no triangulatable faces",
+                    })
+                    context.window_manager.progress_update(progress_index)
+                    continue
+
+                reduced = wedge_backend.simplify_wedge_mesh_partitioned(
+                    source["vertices"],
+                    source["uvs"],
+                    source["faces"],
+                    face_materials=source["face_materials"],
+                    vertex_domains=source["vertex_domains"],
+                    group_weights=source["group_weights"],
+                    target_ratio=settings.wedge_preview_ratio,
+                    uv_weight=settings.qem_uv_weight,
+                    uv_distance_limit=settings.qem_uv_distance_limit,
+                    lock_border_vertices=settings.wedge_lock_borders,
+                    allow_domain_crossing=False,
+                    safe_weld=True,
+                    reject_face_flips=settings.wedge_reject_face_flips,
+                    max_iterations=max(settings.wedge_max_iterations, len(source["faces"])),
+                    boundary_weight=settings.boundary_weight,
+                    preserve_manifold=settings.preserve_manifold,
+                    target_faces=settings.wedge_target_triangles or None,
+                )
+                preview = create_wedge_preview_object(
+                    context,
+                    obj,
+                    reduced,
+                    preview_collection,
+                    write_custom_normals=settings.wedge_write_custom_normals,
+                )
+                collision = create_collision_box_proxy(context, obj, collision_collection)
+                validation = compare_payloads(source, reduced)
+                gate = validation_gate(validation, settings)
                 results.append({
                     "source": obj.name,
-                    "status": "skipped",
-                    "reason": "no triangulatable faces",
+                    "preview": preview.name,
+                    "collision_proxy": collision.name,
+                    "status": "created",
+                    "part_type": stats["part_type"],
+                    "risk": stats["risk"],
+                    "source_triangles": len(source["faces"]),
+                    "preview_triangles": len(reduced["faces"]),
+                    "preview_vertices": len(reduced["vertices"]),
+                    "stats": reduced["stats"],
+                    "validation": validation,
+                    "validation_gate": gate,
                 })
-                continue
-
-            reduced = wedge_backend.simplify_wedge_mesh_partitioned(
-                source["vertices"],
-                source["uvs"],
-                source["faces"],
-                face_materials=source["face_materials"],
-                vertex_domains=source["vertex_domains"],
-                group_weights=source["group_weights"],
-                target_ratio=settings.wedge_preview_ratio,
-                uv_weight=settings.qem_uv_weight,
-                uv_distance_limit=settings.qem_uv_distance_limit,
-                lock_border_vertices=settings.wedge_lock_borders,
-                allow_domain_crossing=False,
-                safe_weld=True,
-                reject_face_flips=settings.wedge_reject_face_flips,
-                max_iterations=max(settings.wedge_max_iterations, len(source["faces"])),
-                boundary_weight=settings.boundary_weight,
-                preserve_manifold=settings.preserve_manifold,
-                target_faces=settings.wedge_target_triangles or None,
-            )
-            preview = create_wedge_preview_object(
-                context,
-                obj,
-                reduced,
-                preview_collection,
-                write_custom_normals=settings.wedge_write_custom_normals,
-            )
-            collision = create_collision_box_proxy(context, obj, collision_collection)
-            validation = compare_payloads(source, reduced)
-            gate = validation_gate(validation, settings)
-            results.append({
-                "source": obj.name,
-                "preview": preview.name,
-                "collision_proxy": collision.name,
-                "status": "created",
-                "part_type": stats["part_type"],
-                "risk": stats["risk"],
-                "source_triangles": len(source["faces"]),
-                "preview_triangles": len(reduced["faces"]),
-                "preview_vertices": len(reduced["vertices"]),
-                "stats": reduced["stats"],
-                "validation": validation,
-                "validation_gate": gate,
-            })
+                context.window_manager.progress_update(progress_index)
+        finally:
+            context.window_manager.progress_end()
 
         report = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1552,24 +1600,35 @@ class VLOD_OT_generate(bpy.types.Operator):
         angle_limit = math.radians(settings.hard_edge_angle_degrees)
         results = []
 
-        for lod_name, ratio in lods:
-            for obj in source_objects:
-                stats = analyse_mesh_object(obj, angle_limit)
-                new_obj = duplicate_for_lod(obj, lod_name, collection)
-                create_protection_vertex_group(new_obj, angle_limit)
-                action = apply_decimate_modifier(new_obj, settings, ratio, stats["part_type"])
-                if action == "deleted tiny detail":
-                    continue
-                new_stats = analyse_mesh_object(new_obj, angle_limit)
-                results.append({
-                    "source": obj.name,
-                    "lod": lod_name,
-                    "part_type": stats["part_type"],
-                    "action": action,
-                    "before_triangles": stats["triangles"],
-                    "after_triangles": new_stats["triangles"],
-                    "ratio": round(new_stats["triangles"] / max(1, stats["triangles"]), 4),
-                })
+        progress_total = len(lods) * len(source_objects)
+        progress_index = 0
+        context.window_manager.progress_begin(0, progress_total)
+        try:
+            for lod_name, ratio in lods:
+                for obj in source_objects:
+                    progress_index += 1
+                    context.window_manager.progress_update(progress_index - 1)
+                    report_progress_milestone(self, progress_index, progress_total, obj.name, f"Generate {lod_name}")
+                    stats = analyse_mesh_object(obj, angle_limit)
+                    new_obj = duplicate_for_lod(obj, lod_name, collection)
+                    create_protection_vertex_group(new_obj, angle_limit)
+                    action = apply_decimate_modifier(new_obj, settings, ratio, stats["part_type"])
+                    if action == "deleted tiny detail":
+                        context.window_manager.progress_update(progress_index)
+                        continue
+                    new_stats = analyse_mesh_object(new_obj, angle_limit)
+                    results.append({
+                        "source": obj.name,
+                        "lod": lod_name,
+                        "part_type": stats["part_type"],
+                        "action": action,
+                        "before_triangles": stats["triangles"],
+                        "after_triangles": new_stats["triangles"],
+                        "ratio": round(new_stats["triangles"] / max(1, stats["triangles"]), 4),
+                    })
+                    context.window_manager.progress_update(progress_index)
+        finally:
+            context.window_manager.progress_end()
 
         report = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
