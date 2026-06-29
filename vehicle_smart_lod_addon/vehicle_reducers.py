@@ -400,6 +400,7 @@ def radial_reduce(
     axis_dir=None,
     target_segments=16,
     precision=5,
+    uv_reconstruction="auto",
 ):
     """Decimate a surface of revolution in the angular direction.
 
@@ -407,6 +408,15 @@ def radial_reduce(
     evenly spaced angular bins; its radius and axial height are preserved. Mesh
     vertices that snap to the same (position, domain) are welded, which removes
     whole angular rings while keeping the tyre's cross-section profile intact.
+
+    ``uv_reconstruction`` controls UVs assigned to welded vertices:
+
+      * ``"auto"`` (default) detects likely circumferential/tread UV bands and
+        reconstructs the angular UV coordinate from the snapped segment.
+      * ``"interpolate"`` always reconstructs the detected angular coordinate
+        when possible.
+      * ``"average"`` only averages the source UVs, but still unwraps seam-crossing
+        ranges first so the seam stays continuous.
 
     Returns a dict shaped like the wedge reducer output (vertices/uvs/faces/...).
     """
@@ -434,6 +444,8 @@ def radial_reduce(
     step = 2.0 * math.pi / segments
 
     snapped = []
+    snap_fracs = []
+    angles = []
     for p in vertices:
         d = _sub(p, axis_point)
         h = _dot(d, axis)
@@ -441,7 +453,8 @@ def radial_reduce(
         y = _dot(d, w)
         r = math.hypot(x, y)
         ang = math.atan2(y, x)
-        snap_ang = round(ang / step) * step
+        snap_idx = int(round(ang / step)) % segments
+        snap_ang = snap_idx * step
         sx = math.cos(snap_ang) * r
         sy = math.sin(snap_ang) * r
         new = _add(
@@ -449,10 +462,75 @@ def radial_reduce(
             _add(_scale(u, sx), _scale(w, sy)),
         )
         snapped.append((float(new[0]), float(new[1]), float(new[2])))
+        snap_fracs.append(snap_idx / float(segments))
+        angles.append((ang % (2.0 * math.pi)) / (2.0 * math.pi))
 
-    # weld by (snapped position, domain): keeps the first UV/weights seen
+    def _unwrap_unit_values(vals):
+        if not vals:
+            return []
+        out = [float(vals[0])]
+        for val in vals[1:]:
+            x = float(val)
+            while x - out[-1] > 0.5:
+                x -= 1.0
+            while x - out[-1] < -0.5:
+                x += 1.0
+            out.append(x)
+        return out
+
+    def _wrap01(x):
+        x = float(x) % 1.0
+        return 0.0 if abs(x - 1.0) < 1e-9 else x
+
+    # Find a UV component that behaves like the tyre tread/circumference axis.
+    # Such a component has broad 0..1 variation around the ring; if it is later
+    # averaged inside snapped angular bins, the tread texture collapses or jumps.
+    uv_mode = (uv_reconstruction or "auto").lower()
+    uv_fit = None
+    if uvs and uv_mode in {"auto", "interpolate"}:
+        order = sorted(range(min(n, len(uvs))), key=lambda i: angles[i])
+        best = None
+        for comp in (0, 1):
+            seq = _unwrap_unit_values([uvs[i][comp] for i in order])
+            if len(seq) < 2:
+                continue
+            rng = max(seq) - min(seq)
+            if rng < 0.25:
+                continue
+            xs = [angles[i] for i in order]
+            mx = sum(xs) / len(xs)
+            my = sum(seq) / len(seq)
+            varx = sum((x - mx) ** 2 for x in xs)
+            if varx < 1e-12:
+                continue
+            slope = sum((x - mx) * (y - my) for x, y in zip(xs, seq)) / varx
+            intercept = my - slope * mx
+            score = abs(slope) * rng
+            if best is None or score > best[0]:
+                best = (score, comp, slope, intercept, rng)
+        if best and (uv_mode == "interpolate" or best[4] > 0.5):
+            uv_fit = best[1:]
+
+    def _avg_uv(member_indices, snap_frac):
+        vals = [tuple(float(c) for c in uvs[i]) if i < len(uvs) else (0.0, 0.0) for i in member_indices]
+        if not vals:
+            return (0.0, 0.0)
+        out = [0.0, 0.0]
+        for comp in (0, 1):
+            comp_vals = [v[comp] for v in vals]
+            unwrapped = _unwrap_unit_values(comp_vals)
+            out[comp] = sum(unwrapped) / len(unwrapped)
+        if uv_fit is not None:
+            comp, slope, intercept, _rng = uv_fit
+            out[comp] = slope * snap_frac + intercept
+        return (_wrap01(out[0]), _wrap01(out[1]))
+
+    # weld by (snapped position, domain), then reconstruct/interpolate UVs for
+    # each snapped angular segment instead of keeping whichever source UV arrived
+    # first. Member UVs are seam-unwrapped before averaging to keep continuity.
     key_to_new = {}
     old_to_new = {}
+    members = []
     out_vertices = []
     out_uvs = []
     out_domains = []
@@ -463,6 +541,7 @@ def radial_reduce(
         if key in key_to_new:
             target = key_to_new[key]
             old_to_new[i] = target
+            members[target].append(i)
             # merge weights conservatively
             merged = dict(out_weights[target])
             for gname, gw in group_weights[i].items():
@@ -472,10 +551,15 @@ def radial_reduce(
             new_index = len(out_vertices)
             key_to_new[key] = new_index
             old_to_new[i] = new_index
+            members.append([i])
             out_vertices.append(pos)
-            out_uvs.append(tuple(float(c) for c in uvs[i]) if i < len(uvs) else (0.0, 0.0))
+            out_uvs.append((0.0, 0.0))
             out_domains.append(vertex_domains[i])
             out_weights.append(dict(group_weights[i]))
+
+    for oi, member_indices in enumerate(members):
+        snap_frac = sum(snap_fracs[i] for i in member_indices) / len(member_indices)
+        out_uvs[oi] = _avg_uv(member_indices, snap_frac)
 
     out_faces = []
     out_materials = []

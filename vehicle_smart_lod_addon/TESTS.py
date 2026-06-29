@@ -297,6 +297,62 @@ def test_radial_reduce_preserves_roundness():
     print(f"  PASS radial reduce ({len(faces)} -> {len(res['faces'])} faces, radius held, conf {conf:.2f})")
 
 
+
+def test_radial_reduce_reconstructs_circumferential_tread_uvs():
+    """Snapped tyre segments must keep tread UVs ordered across the seam."""
+    seg, rings = 64, 2
+    verts = []
+    uvs = []
+    for ri in range(rings + 1):
+        z = -0.25 + 0.5 * ri / rings
+        vcoord = ri / rings
+        for si in range(seg):
+            a = 2.0 * math.pi * si / seg
+            verts.append((math.cos(a), math.sin(a), z))
+            # U intentionally follows the circumference and crosses the 0/1 seam.
+            uvs.append((si / seg, vcoord))
+    faces = []
+    for ri in range(rings):
+        for si in range(seg):
+            sj = (si + 1) % seg
+            v0 = ri * seg + si
+            v1 = ri * seg + sj
+            v2 = (ri + 1) * seg + sj
+            v3 = (ri + 1) * seg + si
+            faces.append((v0, v1, v2))
+            faces.append((v0, v2, v3))
+
+    res = vehicle_reducers.radial_reduce(
+        verts, uvs, faces,
+        axis_point=(0.0, 0.0, 0.0), axis_dir=(0.0, 0.0, 1.0),
+        target_segments=16,
+    )
+
+    # Inspect the centre tread band. U should rise steadily with angle; only the
+    # texture seam may wrap. The old first-seen policy produced repeated/stale U
+    # values unrelated to the snapped segment order.
+    band = []
+    for pnt, uv in zip(res["vertices"], res["uvs"]):
+        if abs(pnt[2]) < 1e-6:
+            angle = (math.atan2(pnt[1], pnt[0]) % (2.0 * math.pi)) / (2.0 * math.pi)
+            band.append((angle, uv[0]))
+    assert len(band) == 16, f"expected one centre-band vertex per snapped segment, got {len(band)}"
+    band.sort()
+    u_unwrapped = [band[0][1]]
+    for _angle, u in band[1:]:
+        while u - u_unwrapped[-1] < -0.5:
+            u += 1.0
+        while u - u_unwrapped[-1] > 0.5:
+            u -= 1.0
+        u_unwrapped.append(u)
+    diffs = [u_unwrapped[i + 1] - u_unwrapped[i] for i in range(len(u_unwrapped) - 1)]
+    assert all(d > 0.0 for d in diffs), f"tread U is not monotonic after radial reduce: {u_unwrapped}"
+    expected = 1.0 / 16.0
+    assert max(abs(d - expected) for d in diffs) < 0.03, f"tread U spacing collapsed: {diffs}"
+    seam_step = (u_unwrapped[0] + 1.0) - u_unwrapped[-1]
+    assert abs(seam_step - expected) < 0.03, f"tread U seam discontinuity: {seam_step}"
+    print("  PASS radial tread UV reconstruction (monotonic/continuous U around seam)")
+
 def test_visibility_cull_removes_interior():
     def box(c, s):
         h = s / 2
@@ -481,6 +537,7 @@ def run_all():
         test_attribute_consistency,
         test_smooth_normals_recomputed,
         test_radial_reduce_preserves_roundness,
+        test_radial_reduce_reconstructs_circumferential_tread_uvs,
         test_visibility_cull_removes_interior,
         test_convex_decomposition_tighter,
     ]
