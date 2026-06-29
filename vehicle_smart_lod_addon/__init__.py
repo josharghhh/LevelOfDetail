@@ -353,6 +353,34 @@ def mesh_payload_stats(payload):
     }
 
 
+def mesh_payload_from_mesh(mesh):
+    vertices = [tuple(float(c) for c in vertex.co) for vertex in mesh.vertices]
+    faces = []
+    face_materials = []
+    for poly in mesh.polygons:
+        poly_vertices = tuple(int(v) for v in poly.vertices)
+        for tri in wedge_backend.triangulate_face(poly_vertices):
+            faces.append(tri)
+            face_materials.append(int(poly.material_index))
+    if mesh.uv_layers.active:
+        uv_data = mesh.uv_layers.active.data
+        per_vertex_uv = {}
+        for poly in mesh.polygons:
+            for vert_index, loop_index in zip(poly.vertices, poly.loop_indices):
+                if vert_index not in per_vertex_uv:
+                    uv = uv_data[loop_index].uv
+                    per_vertex_uv[int(vert_index)] = (float(uv.x), float(uv.y))
+        uvs = [per_vertex_uv.get(i, (0.0, 0.0)) for i in range(len(vertices))]
+    else:
+        uvs = [(0.0, 0.0) for _ in vertices]
+    return {
+        "vertices": vertices,
+        "uvs": uvs,
+        "faces": faces,
+        "face_materials": face_materials,
+    }
+
+
 def compare_payloads(source, reduced):
     before = mesh_payload_stats(source)
     after = mesh_payload_stats(reduced)
@@ -360,6 +388,9 @@ def compare_payloads(source, reduced):
         round(after["bbox"]["dimensions"][i] - before["bbox"]["dimensions"][i], 6)
         for i in range(3)
     ]
+    silhouette = vehicle_reducers.sampled_view_silhouette_error(
+        source.get("vertices", []), reduced.get("vertices", [])
+    )
     return {
         "before": before,
         "after": after,
@@ -368,11 +399,90 @@ def compare_payloads(source, reduced):
         "surface_area_ratio": round(after["surface_area"] / max(1e-12, before["surface_area"]), 4),
         "uv_area_ratio": round(after["uv_area"] / max(1e-12, before["uv_area"]), 4),
         "bbox_dimension_delta": bbox_delta,
+        "silhouette": silhouette,
         "materials_preserved": before["material_set"] == after["material_set"],
     }
 
 
-def validation_gate(validation, settings):
+def tangent_space_metrics(mesh, angle_tolerance_degrees=20.0):
+    """Validate tangent-space continuity where Blender mesh data is available."""
+    if not mesh or not mesh.uv_layers.active:
+        return {
+            "has_uv": False,
+            "calculated": False,
+            "warning": "no UV layer; tangents were not calculated",
+        }
+
+    try:
+        mesh.calc_tangents(uvmap=mesh.uv_layers.active.name)
+    except Exception as exc:
+        return {
+            "has_uv": True,
+            "calculated": False,
+            "warning": f"tangent calculation failed: {exc}",
+        }
+
+    edge_loops = defaultdict(list)
+    uv_layer = mesh.uv_layers.active.data
+    for poly in mesh.polygons:
+        verts = list(poly.vertices)
+        loops = list(poly.loop_indices)
+        for i, a in enumerate(verts):
+            b = verts[(i + 1) % len(verts)]
+            loop_a = loops[i]
+            loop_b = loops[(i + 1) % len(loops)]
+            uv_pair = tuple(sorted((
+                tuple(round(float(x), 6) for x in uv_layer[loop_a].uv),
+                tuple(round(float(x), 6) for x in uv_layer[loop_b].uv),
+            )))
+            edge_loops[tuple(sorted((int(a), int(b))))].append((loop_a, loop_b, uv_pair))
+
+    cos_limit = math.cos(math.radians(max(0.0, min(180.0, angle_tolerance_degrees))))
+    seam_edges_checked = 0
+    mirrored_edges = 0
+    handedness_mismatches = 0
+    tangent_angle_exceeds = 0
+    max_tangent_angle = 0.0
+
+    for uses in edge_loops.values():
+        if len(uses) < 2:
+            continue
+        uv_pairs = {use[2] for use in uses}
+        signs = []
+        tangents = []
+        for loop_a, loop_b, _ in uses:
+            for loop_index in (loop_a, loop_b):
+                loop = mesh.loops[loop_index]
+                signs.append(1 if float(loop.bitangent_sign) >= 0.0 else -1)
+                tangent = loop.tangent.normalized()
+                tangents.append(tangent)
+        if len(uv_pairs) > 1:
+            seam_edges_checked += 1
+        if len(set(signs)) > 1:
+            mirrored_edges += 1
+            if len(uv_pairs) > 1:
+                handedness_mismatches += 1
+        for i in range(len(tangents)):
+            for j in range(i + 1, len(tangents)):
+                dot = max(-1.0, min(1.0, float(tangents[i].dot(tangents[j]))))
+                angle = math.degrees(math.acos(dot))
+                max_tangent_angle = max(max_tangent_angle, angle)
+                if dot < cos_limit and (len(uv_pairs) > 1 or len(set(signs)) > 1):
+                    tangent_angle_exceeds += 1
+
+    return {
+        "has_uv": True,
+        "calculated": True,
+        "angle_tolerance_degrees": round(float(angle_tolerance_degrees), 3),
+        "seam_edges_checked": seam_edges_checked,
+        "mirrored_or_handedness_edges": mirrored_edges,
+        "handedness_mismatches_near_uv_seams": handedness_mismatches,
+        "tangent_angle_exceeds": tangent_angle_exceeds,
+        "max_tangent_angle_degrees": round(float(max_tangent_angle), 3),
+    }
+
+
+def validate_lod_pair(validation, settings, tangent_metrics=None):
     warnings = []
     surface_ratio = validation["surface_area_ratio"]
     uv_ratio = validation["uv_area_ratio"]
@@ -396,14 +506,35 @@ def validation_gate(validation, settings):
         if abs(delta) / base > bbox_tol:
             warnings.append(f"bbox {axis} dimension changed by {round(abs(delta) / base, 4)}")
 
+    silhouette_tol = settings.validation_silhouette_tolerance
+    silhouette_error = validation.get("silhouette", {}).get("max_deviation", 0.0)
+    if silhouette_error > silhouette_tol:
+        warnings.append(f"silhouette deviation outside tolerance: {silhouette_error}")
+
     triangle_ratio = validation["triangle_ratio"]
     if triangle_ratio > 0.98:
         warnings.append("little or no reduction achieved")
+
+    if tangent_metrics:
+        target = tangent_metrics.get("reduced", tangent_metrics)
+        if target.get("calculated"):
+            if target.get("handedness_mismatches_near_uv_seams", 0) > 0:
+                warnings.append(
+                    f"tangent handedness changes near UV seams: {target['handedness_mismatches_near_uv_seams']}"
+                )
+            if target.get("tangent_angle_exceeds", 0) > 0:
+                warnings.append(
+                    f"tangent continuity exceeds angular tolerance: {target['tangent_angle_exceeds']}"
+                )
 
     return {
         "passed": not warnings,
         "warnings": warnings,
     }
+
+
+def validation_gate(validation, settings, tangent_metrics=None):
+    return validate_lod_pair(validation, settings, tangent_metrics=tangent_metrics)
 
 
 def create_collision_box_proxy(context, source_obj, collection):
@@ -781,6 +912,20 @@ class VLOD_Settings(bpy.types.PropertyGroup):
         min=0.001,
         max=1.0,
     )
+    validation_silhouette_tolerance: bpy.props.FloatProperty(
+        name="Silhouette Tolerance",
+        description="Allowed sampled-view silhouette deviation before validation warns",
+        default=0.03,
+        min=0.001,
+        max=1.0,
+    )
+    validation_tangent_angle_tolerance: bpy.props.FloatProperty(
+        name="Tangent Angle Tolerance",
+        description="Allowed tangent/normal-space angular discontinuity near UV seams and mirrored regions",
+        default=25.0,
+        min=1.0,
+        max=180.0,
+    )
     create_collision_proxy: bpy.props.BoolProperty(
         name="Create Collision Box Proxy",
         description="Create a simple bounding-box collision proxy for each selected object",
@@ -1052,7 +1197,11 @@ class VLOD_OT_wedge_preview(bpy.types.Operator):
                 write_custom_normals=settings.wedge_write_custom_normals,
             )
             validation = compare_payloads(source, reduced)
-            gate = validation_gate(validation, settings)
+            tangent_metrics = {
+                "source": tangent_space_metrics(obj.data, settings.validation_tangent_angle_tolerance),
+                "reduced": tangent_space_metrics(preview.data, settings.validation_tangent_angle_tolerance),
+            }
+            gate = validation_gate(validation, settings, tangent_metrics=tangent_metrics)
             collision_name = None
             if collision_collection:
                 collision_name = create_collision_box_proxy(context, obj, collision_collection).name
@@ -1070,6 +1219,7 @@ class VLOD_OT_wedge_preview(bpy.types.Operator):
                 "preview_vertex_groups": len({name for weights in reduced.get("group_weights", []) for name in weights}),
                 "stats": reduced["stats"],
                 "validation": validation,
+                "tangent_space": tangent_metrics,
                 "validation_gate": gate,
             })
 
@@ -1454,7 +1604,11 @@ class VLOD_OT_safe_test_pack(bpy.types.Operator):
             )
             collision = create_collision_box_proxy(context, obj, collision_collection)
             validation = compare_payloads(source, reduced)
-            gate = validation_gate(validation, settings)
+            tangent_metrics = {
+                "source": tangent_space_metrics(obj.data, settings.validation_tangent_angle_tolerance),
+                "reduced": tangent_space_metrics(preview.data, settings.validation_tangent_angle_tolerance),
+            }
+            gate = validation_gate(validation, settings, tangent_metrics=tangent_metrics)
             results.append({
                 "source": obj.name,
                 "preview": preview.name,
@@ -1467,6 +1621,7 @@ class VLOD_OT_safe_test_pack(bpy.types.Operator):
                 "preview_vertices": len(reduced["vertices"]),
                 "stats": reduced["stats"],
                 "validation": validation,
+                "tangent_space": tangent_metrics,
                 "validation_gate": gate,
             })
 
@@ -1516,6 +1671,8 @@ class VLOD_OT_safe_defaults(bpy.types.Operator):
         settings.validation_surface_tolerance = 0.25
         settings.validation_uv_tolerance = 0.35
         settings.validation_bbox_tolerance = 0.05
+        settings.validation_silhouette_tolerance = 0.03
+        settings.validation_tangent_angle_tolerance = 25.0
         settings.create_collision_proxy = False
         settings.boundary_weight = 2.0
         settings.preserve_manifold = True
@@ -1561,6 +1718,15 @@ class VLOD_OT_generate(bpy.types.Operator):
                 if action == "deleted tiny detail":
                     continue
                 new_stats = analyse_mesh_object(new_obj, angle_limit)
+                validation = compare_payloads(
+                    mesh_payload_from_mesh(obj.data),
+                    mesh_payload_from_mesh(new_obj.data),
+                )
+                tangent_metrics = {
+                    "source": tangent_space_metrics(obj.data, settings.validation_tangent_angle_tolerance),
+                    "reduced": tangent_space_metrics(new_obj.data, settings.validation_tangent_angle_tolerance),
+                }
+                gate = validation_gate(validation, settings, tangent_metrics=tangent_metrics)
                 results.append({
                     "source": obj.name,
                     "lod": lod_name,
@@ -1569,6 +1735,9 @@ class VLOD_OT_generate(bpy.types.Operator):
                     "before_triangles": stats["triangles"],
                     "after_triangles": new_stats["triangles"],
                     "ratio": round(new_stats["triangles"] / max(1, stats["triangles"]), 4),
+                    "validation": validation,
+                    "tangent_space": tangent_metrics,
+                    "validation_gate": gate,
                 })
 
         report = {
@@ -1637,6 +1806,8 @@ class VLOD_PT_panel(bpy.types.Panel):
         layout.prop(settings, "wedge_max_iterations")
         layout.prop(settings, "allow_heavy_preview")
         layout.prop(settings, "safe_test_object_limit")
+        layout.prop(settings, "validation_silhouette_tolerance")
+        layout.prop(settings, "validation_tangent_angle_tolerance")
         layout.prop(settings, "create_collision_proxy")
         layout.operator("vlod.wedge_preview", icon="MESH_DATA")
         layout.operator("vlod.backend_selftest", icon="CHECKMARK")

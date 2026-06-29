@@ -92,6 +92,100 @@ def _face_normal(vertices, face):
     return None
 
 
+VEHICLE_SILHOUETTE_VIEW_DIRECTIONS = (
+    (0.0, -1.0, 0.0),   # front
+    (0.0, 1.0, 0.0),    # rear
+    (-1.0, 0.0, 0.0),   # left side
+    (1.0, 0.0, 0.0),    # right side
+    (0.6, -0.6, 0.5),   # top-front quarter
+    (-0.6, -0.6, 0.5),  # opposite top-front quarter
+    (0.6, 0.6, 0.5),    # top-rear quarter
+    (-0.6, 0.6, 0.5),   # opposite top-rear quarter
+)
+
+
+def _view_basis(direction):
+    forward = _normalize(direction, (0.0, 0.0, 1.0))
+    up_hint = (0.0, 0.0, 1.0)
+    if abs(_dot(forward, up_hint)) > 0.95:
+        up_hint = (0.0, 1.0, 0.0)
+    right = _normalize(_cross(up_hint, forward), (1.0, 0.0, 0.0))
+    up = _normalize(_cross(forward, right), (0.0, 0.0, 1.0))
+    return right, up
+
+
+def _projected_bbox(vertices, direction):
+    if not vertices:
+        return {
+            "min": (0.0, 0.0),
+            "max": (0.0, 0.0),
+            "width": 0.0,
+            "height": 0.0,
+            "area": 0.0,
+            "diagonal": 0.0,
+        }
+    right, up = _view_basis(direction)
+    points = [(_dot(v, right), _dot(v, up)) for v in vertices]
+    min_x = min(p[0] for p in points)
+    max_x = max(p[0] for p in points)
+    min_y = min(p[1] for p in points)
+    max_y = max(p[1] for p in points)
+    width = max_x - min_x
+    height = max_y - min_y
+    return {
+        "min": (min_x, min_y),
+        "max": (max_x, max_y),
+        "width": width,
+        "height": height,
+        "area": width * height,
+        "diagonal": math.sqrt(width * width + height * height),
+    }
+
+
+def sampled_view_silhouette_error(source_vertices, reduced_vertices, directions=None):
+    """Compare projected silhouettes from deterministic vehicle view directions.
+
+    This intentionally uses a fast projection-envelope approximation rather
+    than rasterization so it can run inside Blender reports and pure-Python
+    tests. The returned per-view ``deviation`` is the largest projected bbox edge
+    movement normalized by the source projected diagonal; ``area_ratio`` tracks
+    gross silhouette shrink/growth for the same view.
+    """
+    directions = directions or VEHICLE_SILHOUETTE_VIEW_DIRECTIONS
+    source_vertices = [tuple(float(c) for c in v) for v in (source_vertices or [])]
+    reduced_vertices = [tuple(float(c) for c in v) for v in (reduced_vertices or [])]
+    per_view = []
+    max_deviation = 0.0
+    max_area_delta = 0.0
+    for direction in directions:
+        src = _projected_bbox(source_vertices, direction)
+        red = _projected_bbox(reduced_vertices, direction)
+        denom = max(src["diagonal"], 1e-9)
+        edge_delta = max(
+            abs(red["min"][0] - src["min"][0]),
+            abs(red["min"][1] - src["min"][1]),
+            abs(red["max"][0] - src["max"][0]),
+            abs(red["max"][1] - src["max"][1]),
+        )
+        deviation = edge_delta / denom
+        area_ratio = red["area"] / max(src["area"], 1e-12)
+        area_delta = abs(area_ratio - 1.0)
+        max_deviation = max(max_deviation, deviation)
+        max_area_delta = max(max_area_delta, area_delta)
+        per_view.append({
+            "direction": [round(float(c), 6) for c in _normalize(direction, (0.0, 0.0, 1.0))],
+            "deviation": round(float(deviation), 6),
+            "area_ratio": round(float(area_ratio), 6),
+            "source_area": round(float(src["area"]), 6),
+            "reduced_area": round(float(red["area"]), 6),
+        })
+    return {
+        "max_deviation": round(float(max_deviation), 6),
+        "max_area_delta": round(float(max_area_delta), 6),
+        "views": per_view,
+    }
+
+
 # ===========================================================================
 # 0. Smoothing-group / normal-domain partitioning
 # ===========================================================================
