@@ -1088,7 +1088,7 @@ class VLOD_OT_wedge_preview(bpy.types.Operator):
             context.scene.collection.children.link(collision_collection)
         results = []
 
-        for obj in objects:
+        for obj in progress_object_loop(context, self, objects, "Wedge preview"):
             source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
             if not source["faces"]:
                 results.append({
@@ -1366,7 +1366,7 @@ class VLOD_OT_collision_hull(bpy.types.Operator):
         context.scene.collection.children.link(collection)
         results = []
 
-        for obj in objects:
+        for obj in progress_object_loop(context, self, objects, "Collision proxy"):
             if settings.collision_method == "BOX":
                 proxy = create_collision_box_proxy(context, obj, collection)
                 results.append({
@@ -1489,7 +1489,9 @@ class VLOD_OT_safe_test_pack(bpy.types.Operator):
         context.scene.collection.children.link(collision_collection)
 
         marked_vertices = 0
-        for obj, _ in analysed:
+        for obj, _ in progress_object_loop(
+            context, self, analysed, "Safe test constraints", name_fn=lambda item: item[0].name
+        ):
             _, count = create_protection_vertex_group(obj, angle_limit)
             marked_vertices += count
 
@@ -1503,7 +1505,9 @@ class VLOD_OT_safe_test_pack(bpy.types.Operator):
                     "reason": "not in safe preview candidate set or above triangle guard",
                 })
 
-        for obj, stats in candidates:
+        for obj, stats in progress_object_loop(
+            context, self, candidates, "Safe test preview", name_fn=lambda item: item[0].name
+        ):
             source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
             if not source["faces"]:
                 results.append({
