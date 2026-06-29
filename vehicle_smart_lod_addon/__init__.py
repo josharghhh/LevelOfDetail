@@ -303,6 +303,63 @@ def create_wedge_preview_object(context, source_obj, result, collection, write_c
     return new_obj
 
 
+
+def apply_wedge_result_to_lod_object(obj, source_obj, result, write_custom_normals=False):
+    """Replace a duplicated LOD object's mesh data with a wedge reducer result."""
+    old_mesh = obj.data
+    mesh = bpy.data.meshes.new(f"{old_mesh.name}.wedge_qem")
+    mesh.from_pydata(result["vertices"], [], result["faces"])
+    mesh.update()
+
+    for slot in source_obj.material_slots:
+        mesh.materials.append(slot.material)
+
+    for poly, mat_index in zip(mesh.polygons, result.get("face_materials", [])):
+        poly.material_index = min(int(mat_index), max(0, len(mesh.materials) - 1))
+
+    if result.get("uvs"):
+        uv_layer = mesh.uv_layers.new(name="UVMap")
+        for poly in mesh.polygons:
+            for loop_index, vert_index in zip(poly.loop_indices, poly.vertices):
+                if vert_index < len(result["uvs"]):
+                    uv_layer.data[loop_index].uv = result["uvs"][vert_index]
+
+    if write_custom_normals and result.get("vertex_domains"):
+        try:
+            smooth_normals = vehicle_reducers.compute_smooth_normals(
+                result["vertices"], result["faces"], result.get("vertex_domains")
+            )
+            loop_normals = []
+            for poly in mesh.polygons:
+                for vert_index in poly.vertices:
+                    if vert_index < len(smooth_normals):
+                        loop_normals.append(tuple(float(v) for v in smooth_normals[vert_index]))
+                    else:
+                        loop_normals.append((0.0, 0.0, 1.0))
+            mesh.normals_split_custom_set(loop_normals)
+            if hasattr(mesh, "use_auto_smooth"):
+                mesh.use_auto_smooth = True
+            for poly in mesh.polygons:
+                poly.use_smooth = True
+            mesh.update()
+        except Exception:
+            pass
+
+    obj.data = mesh
+    # Copy material and vertex-group payloads from the wedge result onto the generated LOD object.
+    while obj.vertex_groups:
+        obj.vertex_groups.remove(obj.vertex_groups[0])
+    group_names = sorted({name for weights in result.get("group_weights", []) for name in weights})
+    groups = {name: obj.vertex_groups.new(name=name) for name in group_names}
+    for vertex_index, weights in enumerate(result.get("group_weights", [])):
+        for group_name, weight in weights.items():
+            if weight > 0.0 and group_name in groups:
+                groups[group_name].add([vertex_index], weight, "REPLACE")
+
+    if old_mesh.users == 0:
+        bpy.data.meshes.remove(old_mesh)
+    return obj
+
 def mesh_surface_area(mesh):
     return sum(poly.area for poly in mesh.polygons)
 
@@ -777,6 +834,36 @@ class VLOD_Settings(bpy.types.PropertyGroup):
         min=0.005,
         max=1.0,
     )
+    lod_generation_method: bpy.props.EnumProperty(
+        name="Generation Method",
+        description="Reducer used when generating production LOD output meshes",
+        items=[
+            ("DECIMATE", "Blender Decimate", "Use the existing Blender Decimate modifier workflow"),
+            ("WEDGE_QEM", "Wedge QEM", "Use UV/material/normal-domain-safe wedge QEM reduction"),
+        ],
+        default="DECIMATE",
+    )
+    lod1_target_triangles: bpy.props.IntProperty(
+        name="LOD1 Target Tris (0=ratio)",
+        description="Absolute triangle budget for LOD1 when using Wedge QEM. 0 uses LOD1 Ratio.",
+        default=0,
+        min=0,
+        max=5000000,
+    )
+    lod2_target_triangles: bpy.props.IntProperty(
+        name="LOD2 Target Tris (0=ratio)",
+        description="Absolute triangle budget for LOD2 when using Wedge QEM. 0 uses LOD2 Ratio.",
+        default=0,
+        min=0,
+        max=5000000,
+    )
+    lod3_target_triangles: bpy.props.IntProperty(
+        name="LOD3 Target Tris (0=ratio)",
+        description="Absolute triangle budget for LOD3 when using Wedge QEM. 0 uses LOD3 Ratio.",
+        default=0,
+        min=0,
+        max=5000000,
+    )
     planar_angle_degrees: bpy.props.FloatProperty(
         name="Planar Angle",
         description="Angle threshold for planar dissolve",
@@ -1146,7 +1233,7 @@ class VLOD_OT_wedge_preview(bpy.types.Operator):
             context.scene.collection.children.link(collision_collection)
         results = []
 
-        for obj in objects:
+        for obj in progress_object_loop(context, self, objects, "Wedge preview"):
             source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
             if not source["faces"]:
                 results.append({
@@ -1429,7 +1516,7 @@ class VLOD_OT_collision_hull(bpy.types.Operator):
         context.scene.collection.children.link(collection)
         results = []
 
-        for obj in objects:
+        for obj in progress_object_loop(context, self, objects, "Collision proxy"):
             if settings.collision_method == "BOX":
                 proxy = create_collision_box_proxy(context, obj, collection)
                 results.append({
@@ -1552,7 +1639,9 @@ class VLOD_OT_safe_test_pack(bpy.types.Operator):
         context.scene.collection.children.link(collision_collection)
 
         marked_vertices = 0
-        for obj, _ in analysed:
+        for obj, _ in progress_object_loop(
+            context, self, analysed, "Safe test constraints", name_fn=lambda item: item[0].name
+        ):
             _, count = create_protection_vertex_group(obj, angle_limit)
             marked_vertices += count
 
@@ -1566,7 +1655,9 @@ class VLOD_OT_safe_test_pack(bpy.types.Operator):
                     "reason": "not in safe preview candidate set or above triangle guard",
                 })
 
-        for obj, stats in candidates:
+        for obj, stats in progress_object_loop(
+            context, self, candidates, "Safe test preview", name_fn=lambda item: item[0].name
+        ):
             source = build_wedge_source(obj, math.radians(settings.hard_edge_angle_degrees))
             if not source["faces"]:
                 results.append({
@@ -1695,11 +1786,11 @@ class VLOD_OT_generate(bpy.types.Operator):
         settings = context.scene.vehicle_smart_lod
         lods = []
         if settings.create_lod1:
-            lods.append(("LOD1", settings.lod1_ratio))
+            lods.append(("LOD1", settings.lod1_ratio, settings.lod1_target_triangles))
         if settings.create_lod2:
-            lods.append(("LOD2", settings.lod2_ratio))
+            lods.append(("LOD2", settings.lod2_ratio, settings.lod2_target_triangles))
         if settings.create_lod3:
-            lods.append(("LOD3", settings.lod3_ratio))
+            lods.append(("LOD3", settings.lod3_ratio, settings.lod3_target_triangles))
         if not lods:
             self.report({"WARNING"}, "Enable at least one LOD output.")
             return {"CANCELLED"}
@@ -1709,14 +1800,60 @@ class VLOD_OT_generate(bpy.types.Operator):
         angle_limit = math.radians(settings.hard_edge_angle_degrees)
         results = []
 
-        for lod_name, ratio in lods:
+        for lod_name, ratio, absolute_target_faces in lods:
             for obj in source_objects:
                 stats = analyse_mesh_object(obj, angle_limit)
+                source_triangles = stats["triangles"]
+                target_faces = absolute_target_faces or max(1, int(round(source_triangles * ratio)))
                 new_obj = duplicate_for_lod(obj, lod_name, collection)
-                create_protection_vertex_group(new_obj, angle_limit)
-                action = apply_decimate_modifier(new_obj, settings, ratio, stats["part_type"])
-                if action == "deleted tiny detail":
-                    continue
+                validation = None
+                gate = {"passed": True, "warnings": []}
+
+                if settings.lod_generation_method == "WEDGE_QEM":
+                    source = build_wedge_source(obj, angle_limit)
+                    if not source["faces"]:
+                        action = "skipped no triangulatable faces"
+                    elif stats["part_type"] in {"glass"} and settings.skip_glass:
+                        action = "skipped glass"
+                    elif stats["part_type"] in {"tiny_detail"} and settings.delete_tiny_details:
+                        bpy.data.objects.remove(new_obj, do_unlink=True)
+                        continue
+                    else:
+                        reducer = wedge_backend.simplify_wedge_mesh_partitioned if settings.wedge_partition_islands else wedge_backend.simplify_wedge_mesh
+                        reduced = reducer(
+                            source["vertices"],
+                            source["uvs"],
+                            source["faces"],
+                            face_materials=source["face_materials"],
+                            vertex_domains=source["vertex_domains"],
+                            group_weights=source["group_weights"],
+                            target_ratio=ratio,
+                            uv_weight=settings.qem_uv_weight,
+                            uv_distance_limit=settings.qem_uv_distance_limit,
+                            lock_border_vertices=settings.wedge_lock_borders,
+                            allow_domain_crossing=False,
+                            safe_weld=True,
+                            reject_face_flips=settings.wedge_reject_face_flips,
+                            max_iterations=max(settings.wedge_max_iterations, len(source["faces"])),
+                            boundary_weight=settings.boundary_weight,
+                            preserve_manifold=settings.preserve_manifold,
+                            target_faces=target_faces if absolute_target_faces else None,
+                        )
+                        apply_wedge_result_to_lod_object(
+                            new_obj,
+                            obj,
+                            reduced,
+                            write_custom_normals=settings.wedge_write_custom_normals,
+                        )
+                        validation = compare_payloads(source, reduced)
+                        gate = validation_gate(validation, settings)
+                        action = "wedge qem reduced"
+                else:
+                    create_protection_vertex_group(new_obj, angle_limit)
+                    action = apply_decimate_modifier(new_obj, settings, ratio, stats["part_type"])
+                    if action == "deleted tiny detail":
+                        continue
+
                 new_stats = analyse_mesh_object(new_obj, angle_limit)
                 validation = compare_payloads(
                     mesh_payload_from_mesh(obj.data),
@@ -1731,18 +1868,22 @@ class VLOD_OT_generate(bpy.types.Operator):
                     "source": obj.name,
                     "lod": lod_name,
                     "part_type": stats["part_type"],
+                    "method": settings.lod_generation_method,
                     "action": action,
-                    "before_triangles": stats["triangles"],
+                    "before_triangles": source_triangles,
+                    "target_faces": target_faces,
+                    "target_faces_mode": "absolute" if absolute_target_faces else "ratio",
+                    "achieved_faces": new_stats["triangles"],
                     "after_triangles": new_stats["triangles"],
-                    "ratio": round(new_stats["triangles"] / max(1, stats["triangles"]), 4),
+                    "ratio": round(new_stats["triangles"] / max(1, source_triangles), 4),
                     "validation": validation,
-                    "tangent_space": tangent_metrics,
-                    "validation_gate": gate,
+                    "validation_warnings": gate.get("warnings", []),
                 })
 
         report = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "operation": "generate_conservative_lods",
+            "generation_method": settings.lod_generation_method,
             "results": results,
         }
         out_path = write_report(report)
@@ -1774,12 +1915,16 @@ class VLOD_PT_panel(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="LOD Outputs")
+        box.prop(settings, "lod_generation_method")
         box.prop(settings, "create_lod1")
         box.prop(settings, "lod1_ratio")
+        box.prop(settings, "lod1_target_triangles")
         box.prop(settings, "create_lod2")
         box.prop(settings, "lod2_ratio")
+        box.prop(settings, "lod2_target_triangles")
         box.prop(settings, "create_lod3")
         box.prop(settings, "lod3_ratio")
+        box.prop(settings, "lod3_target_triangles")
 
         layout.separator()
         layout.prop(settings, "skip_glass")
